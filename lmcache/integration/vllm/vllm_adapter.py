@@ -322,6 +322,97 @@ def lmcache_should_store(
             selected_token_indices_idx += 1
     return store_status
 
+@_lmcache_nvtx_annotate
+def lmcache_store_kv_v1(
+    model_config: ModelConfig,
+    parallel_config: ParallelConfig,
+    cache_config: CacheConfig,
+    model_executable: torch.nn.Module,
+    scheduler_output: "SchedulerOutput",
+    kv_caches: List[torch.Tensor],
+    store_status: List[StoreStatus],
+    attn_metadata: "FlashAttentionMetadata",
+    input_ids: torch.Tensor
+) -> None:
+    """Store KV caches into LMCache with v1 scheduler output"""
+    engine = LMCacheEngineBuilder.get(ENGINE_NAME)
+    assert engine is not None, "LMCache engine not initialized."
+
+    # Extract metadata from attn_metadata
+    seq_lens = attn_metadata.seq_lens
+    slot_mapping = attn_metadata.slot_mapping.flatten()
+    query_start_loc = attn_metadata.query_start_loc
+    block_tables = attn_metadata.block_tables
+
+    # Initialize sequence tracking
+    seq_data_idx = 0
+    next_start_pos = 0
+
+    # Process scheduled requests
+    for req_idx, req in enumerate(scheduler_output.scheduled_new_reqs):
+        status = store_status[req_idx]
+        if status == StoreStatus.NONE:
+            continue
+
+        # Get sequence data from request
+        seq_len = req.prompt_len if status in [
+            StoreStatus.SUFFIX_PREFILL, StoreStatus.CHUNK_PREFILL
+        ] else req.total_tokens
+
+        # Get token IDs from request
+        current_tokens = torch.tensor(
+            req.prompt_token_ids[:seq_len],
+            device="cpu"
+        )
+
+        # Original skip logic
+        skip_leading_tokens = engine.lookup(current_tokens)
+        assert skip_leading_tokens <= seq_len
+
+        # Calculate token positions
+        vllm_num_required_tokens = (query_start_loc[seq_data_idx + 1] -
+                                    query_start_loc[seq_data_idx]).item()
+        start_pos = next_start_pos
+        end_pos = start_pos + vllm_num_required_tokens
+        next_start_pos = end_pos
+
+        # Slot mapping handling
+        vllm_num_computed_tokens = seq_len - vllm_num_required_tokens
+        if vllm_num_computed_tokens > 0:
+            # Handle partial sequence storage
+            slot_mapping_req_full = torch.full(
+                (seq_len, ),
+                -1,
+                device=slot_mapping.device,
+                dtype=slot_mapping.dtype
+            )
+            slot_mapping_req_full[vllm_num_computed_tokens:] = \
+                slot_mapping[start_pos:end_pos]
+        else:
+            slot_mapping_req_full = slot_mapping[start_pos:end_pos]
+
+        # Storage logic
+        if skip_leading_tokens < seq_len:
+            # Generate mask and store
+            kv_tensors_mask = torch.ones_like(current_tokens, dtype=torch.bool)
+            kv_tensors_mask[:skip_leading_tokens] = False
+
+            engine.store(
+                current_tokens,
+                kv_tensors_mask,
+                kvcaches=kv_caches,
+                slot_mapping=slot_mapping_req_full,
+                offset=skip_leading_tokens
+            )
+            stored_token_num = seq_len - skip_leading_tokens
+        else:
+            stored_token_num = 0
+
+        logger.info(
+            f"lmcache_store_kv_v1 Store skips {skip_leading_tokens} tokens "
+            f"and stores {stored_token_num} tokens"
+        )
+        seq_data_idx += 1
 
 @_lmcache_nvtx_annotate
 def lmcache_store_kv(
@@ -692,6 +783,162 @@ def lmcache_retrieve_kv(
     logger.debug("Returning the original input!")
     return model_input, False, None
 
+
+@_lmcache_nvtx_annotate
+def lmcache_retrieve_kv_v1(
+        model_executable: torch.nn.Module,
+        scheduler_output: "SchedulerOutput",
+        cache_config: CacheConfig,
+        kv_caches: List[torch.Tensor],
+        retrieve_status: List[RetrieveStatus],
+        input_ids: torch.Tensor,
+        attn_metadata: "FlashAttentionMetadata",
+        positions: torch.Tensor,
+        inputs_embeds: torch.Tensor
+) -> Tuple[Union[torch.Tensor, IntermediateTensors], bool, torch.Tensor, torch.Tensor, torch.Tensor]:
+
+    # Initialize LMCache engine
+    engine = LMCacheEngineBuilder.get(ENGINE_NAME)
+    assert engine is not None, "LMCache engine is not initialized."
+
+    # 初始化返回参数（保持与目标函数完全一致）
+    modified_input_ids = input_ids
+    modified_positions = positions
+    modified_inputs_embeds = inputs_embeds
+    hidden_or_intermediate_states = None
+    bypass_model_exec = False
+    num_decodes = len(scheduler_output.scheduled_cached_reqs)
+    prefill_start_loc = attn_metadata.query_start_loc[num_decodes:].tolist()
+
+    # 获取关键元数据（保持原始访问方式）
+    slot_mapping = attn_metadata.slot_mapping.view(-1)
+    block_tables = attn_metadata.block_tables
+    query_start_loc = attn_metadata.query_start_loc
+    seq_lens = attn_metadata.seq_lens
+
+    # 初始化统计变量
+    total_tokens = 0
+    cached_tokens = 0
+    hidden_states_list = []
+    num_computed_tokens_list = []
+
+    # 遍历所有新请求（保持原版枚举逻辑）
+    for idx, req in enumerate(scheduler_output.scheduled_new_reqs):
+        # 获取请求的token序列（保持原版实现）
+        current_tokens = torch.tensor(
+            req.prompt_token_ids
+        ).to(attn_metadata.query_start_loc.device)
+        req_len = current_tokens.shape[0]
+        total_tokens += req_len
+
+        # 生成full_token_tensor（完全保留原版逻辑）
+        full_token_tensor = current_tokens.cpu()  # 保持CPU设备
+
+        # 生成token_mask（严格保持原始实现）
+        token_mask = torch.ones_like(
+            full_token_tensor,
+            dtype=torch.bool
+        )
+
+        # 根据状态调整mask（原版条件判断逻辑）
+        if retrieve_status[idx] == RetrieveStatus.PREFILL:
+            prefix_len = req_len - (prefill_start_loc[idx + 1] - prefill_start_loc[idx])
+            token_mask[:prefix_len] = False
+        elif retrieve_status[idx] == RetrieveStatus.CHUNK_PREFILL:
+            chunk_size = engine.config.chunk_size
+            aligned_prefix = (req_len - (
+                        prefill_start_loc[idx + 1] - prefill_start_loc[idx])) // chunk_size * chunk_size
+            token_mask[:aligned_prefix] = False
+
+        # 生成物理槽位映射（完全保留原版块展开逻辑）
+        current_slot_mapping = []
+        for block_id in req.block_ids:
+            if block_id == -1:  # 块表结束符
+                break
+            block_start = block_id * cache_config.block_size
+            current_slot_mapping.extend(
+                range(block_start, block_start + cache_config.block_size)
+            )
+        current_slot_mapping = torch.tensor(
+            current_slot_mapping[:req_len],
+            dtype=torch.int64,
+            device=input_ids.device
+        )
+
+        # 执行缓存检索（保持原版调用参数）
+        ret = engine.retrieve(
+            full_token_tensor,
+            token_mask,
+            kvcaches=kv_caches,
+            slot_mapping=current_slot_mapping.cpu()  # 保持CPU输入
+        )
+        roi_tokens, cached_kv, hidden = ret[0], ret[1], ret[2]
+
+        # 处理缓存结果（完全保留原版逻辑）
+        num_computed_tokens = 0 if roi_tokens is None else roi_tokens.shape[0]
+        num_computed_tokens_list.append(num_computed_tokens)
+
+        # 判断是否完全命中
+        if num_computed_tokens == req_len and hidden is not None:
+            hidden_states_list.append(hidden.to(input_ids.device))
+            cached_tokens += req_len
+        else:
+            bypass_model_exec = False
+
+        # 更新KV缓存（严格保留原版内存拷贝逻辑）
+        if cached_kv is not None:
+            kv_cache_size = kv_caches[0].shape[-1]
+            for layer_idx in range(model_executable.model.start_layer,
+                                   model_executable.model.end_layer):
+                layer_cache = kv_caches[layer_idx - model_executable.model.start_layer]
+                layer_cache_flat = layer_cache.view(-1, kv_cache_size)
+                src_cache = cached_kv[layer_idx - model_executable.model.start_layer]
+                layer_cache_flat.index_copy_(
+                    0,
+                    current_slot_mapping[:src_cache.shape[0]],
+                    src_cache.to(layer_cache_flat.device)
+                )
+
+    # 判断全局命中状态（保留原版全命中判断）
+    bypass_model_exec = (cached_tokens == total_tokens) and (total_tokens > 0)
+
+    # 构造最终返回值（严格对齐目标函数行为）
+    if bypass_model_exec:
+        # 合并隐藏状态（保留原版拼接逻辑）
+        hidden_or_intermediate_states = torch.cat(hidden_states_list, dim=0)
+
+        # 调整输入参数维度（完全复制原版裁剪逻辑）
+        modified_input_ids = input_ids[:num_decodes]
+        modified_positions = positions[:num_decodes]
+        modified_inputs_embeds = inputs_embeds[:num_decodes] if inputs_embeds is not None else None
+
+        # 修改注意力元数据（逐项复制原版操作）
+        attn_metadata.query_start_loc = torch.cat([
+            attn_metadata.query_start_loc[:num_decodes],
+            attn_metadata.query_start_loc[-1].unsqueeze(0)
+        ])
+        attn_metadata.num_actual_tokens = num_decodes
+        attn_metadata.slot_mapping = attn_metadata.slot_mapping[:num_decodes]
+        attn_metadata.num_prefills = 0
+        attn_metadata.num_input_tokens = num_decodes
+        attn_metadata.prefill = None
+
+    # 保持原版日志格式（含rank信息）
+    logger.info(
+        "lmcache_retrieve_kv_v1 [rank%d]: %s all KV caches and hidden states, %s model forward pass",
+        torch.distributed.get_rank(),
+        "Successfully retrieved" if bypass_model_exec else "Failed to retrieve",
+        "skipping" if bypass_model_exec else "executing"
+    )
+
+    # 强制设备一致性（防止跨设备错误）
+    return (
+        hidden_or_intermediate_states.to(input_ids.device) if hidden_or_intermediate_states is not None else None,
+        bypass_model_exec,
+        modified_input_ids.to(input_ids.device),
+        modified_positions.to(positions.device),
+        modified_inputs_embeds.to(inputs_embeds.device) if modified_inputs_embeds is not None else None
+    )
 
 def build_partial_prefill_input(
     model_input: "ModelInputForGPUWithSamplingMetadata",
