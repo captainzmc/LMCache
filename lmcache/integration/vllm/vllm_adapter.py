@@ -829,14 +829,15 @@ def lmcache_retrieve_kv_v1(
     # 遍历所有新请求（保持原版枚举逻辑）
     for idx, req in enumerate(scheduler_output.scheduled_new_reqs):
         # 获取请求的token序列（保持原版实现）
+        device = input_ids.device
         current_tokens = torch.tensor(
-            req.prompt_token_ids, device="cpu"
+            req.prompt_token_ids, device=device
         ).to(attn_metadata.query_start_loc.device)
         req_len = current_tokens.shape[0]
         total_tokens += req_len
 
         # 生成full_token_tensor（完全保留原版逻辑）
-        full_token_tensor = current_tokens.cpu()  # 保持CPU设备
+        full_token_tensor = current_tokens
 
         # 生成token_mask（严格保持原始实现）
         token_mask = torch.ones_like(
@@ -844,17 +845,17 @@ def lmcache_retrieve_kv_v1(
             dtype=torch.bool
         )
 
-        prefix_len = req_len - (prefill_start_loc[idx + 1] - prefill_start_loc[idx])
-        token_mask[:prefix_len] = False
+        # prefix_len = req_len - (prefill_start_loc[idx + 1] - prefill_start_loc[idx])
+        # token_mask[:prefix_len] = False
         # # 根据状态调整mask（原版条件判断逻辑）
-        # if retrieve_status[idx] == RetrieveStatus.PREFILL:
-        #     prefix_len = req_len - (prefill_start_loc[idx + 1] - prefill_start_loc[idx])
-        #     token_mask[:prefix_len] = False
-        # elif retrieve_status[idx] == RetrieveStatus.CHUNK_PREFILL:
-        #     chunk_size = engine.config.chunk_size
-        #     aligned_prefix = (req_len - (
-        #                 prefill_start_loc[idx + 1] - prefill_start_loc[idx])) // chunk_size * chunk_size
-        #     token_mask[:aligned_prefix] = False
+        if retrieve_status[idx] == RetrieveStatus.PREFILL:
+            prefix_len = req_len - (prefill_start_loc[idx + 1] - prefill_start_loc[idx])
+            token_mask[:prefix_len] = False
+        elif retrieve_status[idx] == RetrieveStatus.CHUNK_PREFILL:
+            chunk_size = engine.config.chunk_size
+            aligned_prefix = (req_len - (
+                        prefill_start_loc[idx + 1] - prefill_start_loc[idx])) // chunk_size * chunk_size
+            token_mask[:aligned_prefix] = False
 
         # 生成物理槽位映射（完全保留原版块展开逻辑）
         current_slot_mapping = []
@@ -868,7 +869,7 @@ def lmcache_retrieve_kv_v1(
         current_slot_mapping = torch.tensor(
             current_slot_mapping[:req_len],
             dtype=torch.int64,
-            device=input_ids.device
+            device=device
         )
 
         # 执行缓存检索（保持原版调用参数）
@@ -876,8 +877,12 @@ def lmcache_retrieve_kv_v1(
             full_token_tensor,
             token_mask,
             kvcaches=kv_caches,
-            slot_mapping=current_slot_mapping.cpu()  # 保持CPU输入
+            slot_mapping=current_slot_mapping
         )
+        print(f"Return type: {type(ret)}")
+        print(f"Return length: {len(ret)}")
+        print(f"First element type: {type(ret[0])}")
+
         roi_tokens, cached_kv, hidden = ret[0], ret[1], ret[2]
 
         # 处理缓存结果（完全保留原版逻辑）
