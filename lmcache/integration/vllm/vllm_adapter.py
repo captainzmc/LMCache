@@ -879,15 +879,33 @@ def lmcache_retrieve_kv_v1(
             kvcaches=kv_caches,
             slot_mapping=current_slot_mapping
         )
+
+
+        vllm_num_required_tokens = (attn_metadata.query_start_loc[idx + 1] -
+                                    attn_metadata.query_start_loc[idx]).item()
+
+        vllm_num_computed_tokens = req_len - vllm_num_required_tokens
+        lmc_chunk_size = engine.config.chunk_size
+        vllm_num_computed_tokens_align = vllm_num_computed_tokens \
+                                         // lmc_chunk_size * lmc_chunk_size
+        lmc_num_computed_tokens = max(
+            torch.sum(ret).item() - \
+            (vllm_num_computed_tokens - vllm_num_computed_tokens_align),
+            0
+        )
+        num_computed_tokens = vllm_num_computed_tokens + \
+                              lmc_num_computed_tokens
+        num_computed_tokens_list.append(num_computed_tokens)
+
         print(f"Return type: {type(ret)}")
         print(f"Return length: {len(ret)}")
         print(f"First element type: {type(ret[0])}")
 
         roi_tokens, cached_kv, hidden = ret[0], ret[1], ret[2]
-
-        # 处理缓存结果（完全保留原版逻辑）
-        num_computed_tokens = 0 if roi_tokens is None else roi_tokens.shape[0]
-        num_computed_tokens_list.append(num_computed_tokens)
+        #
+        # # # 处理缓存结果（完全保留原版逻辑）
+        # num_computed_tokens = 0 if roi_tokens is None else roi_tokens.shape[0]
+        # num_computed_tokens_list.append(num_computed_tokens)
 
         # 判断是否完全命中
         if num_computed_tokens == req_len and hidden is not None:
