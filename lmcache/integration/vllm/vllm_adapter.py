@@ -331,15 +331,16 @@ def lmcache_store_kv_v1(
     scheduler_output: "SchedulerOutput",
     kv_caches: List[torch.Tensor],
     store_status: List[StoreStatus],
-    attn_metadata: "FlashAttentionMetadata",
-    input_ids: torch.Tensor
+    input_ids: torch.Tensor,
+    attn_metadata: "FlashAttentionMetadata"
 ) -> None:
     """Store KV caches into LMCache with v1 scheduler output"""
     engine = LMCacheEngineBuilder.get(ENGINE_NAME)
     assert engine is not None, "LMCache engine not initialized."
 
     # Extract metadata from attn_metadata
-    #seq_lens = attn_metadata.seq_lens
+    seq_lens = attn_metadata.seq_lens
+    # num_decodes = len(scheduler_output.scheduled_cached_reqs)
     slot_mapping = attn_metadata.slot_mapping.flatten()
     query_start_loc = attn_metadata.query_start_loc
     #block_tables = attn_metadata.block_tables
@@ -350,15 +351,17 @@ def lmcache_store_kv_v1(
 
     # Process scheduled requests
     for req_idx, req in enumerate(scheduler_output.scheduled_new_reqs):
-        # status = store_status[req_idx]
-        # if status == StoreStatus.NONE:
-        #     continue
-        #
+        status = store_status[req_idx]
+        if status == StoreStatus.NONE:
+            continue
+
         # # Get sequence data from request
         # seq_len = req.prompt_len if status in [
         #     StoreStatus.SUFFIX_PREFILL, StoreStatus.CHUNK_PREFILL
         # ] else req.total_tokens
-        seq_len = req.total_tokens;
+        seq_len = seq_lens[req_idx].item() if seq_lens is not None \
+            else req.prompt_len + req.output_len
+
 
         # Get token IDs from request
         current_tokens = torch.tensor(
@@ -827,7 +830,7 @@ def lmcache_retrieve_kv_v1(
     for idx, req in enumerate(scheduler_output.scheduled_new_reqs):
         # 获取请求的token序列（保持原版实现）
         current_tokens = torch.tensor(
-            req.prompt_token_ids
+            req.prompt_token_ids, device="cpu"
         ).to(attn_metadata.query_start_loc.device)
         req_len = current_tokens.shape[0]
         total_tokens += req_len
