@@ -350,14 +350,15 @@ def lmcache_store_kv_v1(
 
     # Process scheduled requests
     for req_idx, req in enumerate(scheduler_output.scheduled_new_reqs):
-        status = store_status[req_idx]
-        if status == StoreStatus.NONE:
-            continue
-
-        # Get sequence data from request
-        seq_len = req.prompt_len if status in [
-            StoreStatus.SUFFIX_PREFILL, StoreStatus.CHUNK_PREFILL
-        ] else req.total_tokens
+        # status = store_status[req_idx]
+        # if status == StoreStatus.NONE:
+        #     continue
+        #
+        # # Get sequence data from request
+        # seq_len = req.prompt_len if status in [
+        #     StoreStatus.SUFFIX_PREFILL, StoreStatus.CHUNK_PREFILL
+        # ] else req.total_tokens
+        seq_len = req.total_tokens;
 
         # Get token IDs from request
         current_tokens = torch.tensor(
@@ -840,15 +841,17 @@ def lmcache_retrieve_kv_v1(
             dtype=torch.bool
         )
 
-        # 根据状态调整mask（原版条件判断逻辑）
-        if retrieve_status[idx] == RetrieveStatus.PREFILL:
-            prefix_len = req_len - (prefill_start_loc[idx + 1] - prefill_start_loc[idx])
-            token_mask[:prefix_len] = False
-        elif retrieve_status[idx] == RetrieveStatus.CHUNK_PREFILL:
-            chunk_size = engine.config.chunk_size
-            aligned_prefix = (req_len - (
-                        prefill_start_loc[idx + 1] - prefill_start_loc[idx])) // chunk_size * chunk_size
-            token_mask[:aligned_prefix] = False
+        prefix_len = req_len - (prefill_start_loc[idx + 1] - prefill_start_loc[idx])
+        token_mask[:prefix_len] = False
+        # # 根据状态调整mask（原版条件判断逻辑）
+        # if retrieve_status[idx] == RetrieveStatus.PREFILL:
+        #     prefix_len = req_len - (prefill_start_loc[idx + 1] - prefill_start_loc[idx])
+        #     token_mask[:prefix_len] = False
+        # elif retrieve_status[idx] == RetrieveStatus.CHUNK_PREFILL:
+        #     chunk_size = engine.config.chunk_size
+        #     aligned_prefix = (req_len - (
+        #                 prefill_start_loc[idx + 1] - prefill_start_loc[idx])) // chunk_size * chunk_size
+        #     token_mask[:aligned_prefix] = False
 
         # 生成物理槽位映射（完全保留原版块展开逻辑）
         current_slot_mapping = []
