@@ -339,10 +339,10 @@ def lmcache_store_kv_v1(
     assert engine is not None, "LMCache engine not initialized."
 
     # Extract metadata from attn_metadata
-    seq_lens = attn_metadata.seq_lens
+    #seq_lens = attn_metadata.seq_lens
     slot_mapping = attn_metadata.slot_mapping.flatten()
     query_start_loc = attn_metadata.query_start_loc
-    block_tables = attn_metadata.block_tables
+    #block_tables = attn_metadata.block_tables
 
     # Initialize sequence tracking
     seq_data_idx = 0
@@ -812,10 +812,10 @@ def lmcache_retrieve_kv_v1(
     prefill_start_loc = attn_metadata.query_start_loc[num_decodes:].tolist()
 
     # 获取关键元数据（保持原始访问方式）
-    slot_mapping = attn_metadata.slot_mapping.view(-1)
-    block_tables = attn_metadata.block_tables
-    query_start_loc = attn_metadata.query_start_loc
-    seq_lens = attn_metadata.seq_lens
+    #slot_mapping = attn_metadata.slot_mapping.view(-1)
+    #block_tables = attn_metadata.block_tables
+    #query_start_loc = attn_metadata.query_start_loc
+    #seq_lens = attn_metadata.seq_lens
 
     # 初始化统计变量
     total_tokens = 0
