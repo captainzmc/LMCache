@@ -872,7 +872,7 @@ def lmcache_retrieve_kv_v1(
             cached_tokens += req_len
 
     if hidden_states_list:
-        # 二次检查维度
+        # 二次检查维度?
         for i, t in enumerate(hidden_states_list):
             if t.dim() < 1:
                 hidden_states_list[i] = t.unsqueeze(0)
@@ -882,7 +882,8 @@ def lmcache_retrieve_kv_v1(
 
     bypass_model_exec = (cached_tokens == total_tokens) and (total_tokens > 0)
     hidden_or_intermediate = torch.cat(hidden_states_list, dim=0) if hidden_states_list else None
-
+    bypass_model_exec = False
+    hidden_or_intermediate = None
     return (
         hidden_or_intermediate.to(input_ids.device) if hidden_or_intermediate is not None else None,
         bypass_model_exec,
